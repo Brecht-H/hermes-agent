@@ -27,7 +27,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -839,6 +839,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             return True, silent_doc, SILENT_MARKER, None
 
     prompt = _build_job_prompt(job, prerun_script=prerun_script)
+    _invoked_at: Optional[float] = _hermes_now().timestamp()
+    _skill_outcome: Optional[Tuple[bool, Optional[str]]] = None
     origin = _resolve_origin(job)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
@@ -1189,12 +1191,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 """
         
         logger.info("Job '%s' completed successfully", job_name)
+        _skill_outcome = (True, "complete")
         return True, output, final_response, None
-        
+
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
-        
+        _skill_outcome = (False, error_msg[:200] if error_msg else None)
+
         output = f"""# Cron Job: {job_name} (FAILED)
 
 **Job ID:** {job_id}
@@ -1227,6 +1231,44 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:
+            # Skill-invocation EMA hook (build #87): one row per
+            # skill listed on this cron job, with cost/duration/tokens
+            # sourced from the agent session row. Slash-command and
+            # ad-hoc skill_view calls are not tracked here in v1.
+            if _skill_outcome is not None and _invoked_at is not None:
+                _job_skills = job.get("skills") or []
+                if _job_skills:
+                    try:
+                        _completed_at = _hermes_now().timestamp()
+                        _sess = _session_db.get_session(_cron_session_id) or {}
+                        _success_flag, _end_reason_val = _skill_outcome
+                        _duration = _completed_at - _invoked_at
+                        for _skill_name in _job_skills:
+                            _sn = str(_skill_name).strip()
+                            if not _sn:
+                                continue
+                            _session_db.record_skill_invocation(
+                                skill_name=_sn,
+                                invoked_at=_invoked_at,
+                                session_id=_cron_session_id,
+                                cron_id=job_id,
+                                completed_at=_completed_at,
+                                duration_seconds=_duration,
+                                model=_sess.get("model"),
+                                provider=_sess.get("billing_provider"),
+                                input_tokens=int(_sess.get("input_tokens") or 0),
+                                output_tokens=int(_sess.get("output_tokens") or 0),
+                                cache_read_tokens=int(_sess.get("cache_read_tokens") or 0),
+                                cache_write_tokens=int(_sess.get("cache_write_tokens") or 0),
+                                estimated_cost_usd=_sess.get("estimated_cost_usd"),
+                                success=_success_flag,
+                                end_reason=_end_reason_val,
+                            )
+                    except (Exception, KeyboardInterrupt) as e:
+                        logger.debug(
+                            "Job '%s': failed to record skill invocations: %s",
+                            job_id, e,
+                        )
             try:
                 _session_db.end_session(_cron_session_id, "cron_complete")
             except (Exception, KeyboardInterrupt) as e:

@@ -25,7 +25,7 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
-from typing import Any, Callable, Dict, List, Optional, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -98,6 +98,50 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS skill_invocations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT REFERENCES sessions(id),
+    cron_id TEXT,
+    skill_name TEXT NOT NULL,
+    skill_version TEXT,
+    invoked_at REAL NOT NULL,
+    completed_at REAL,
+    model TEXT,
+    provider TEXT,
+    duration_seconds REAL,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    cache_write_tokens INTEGER DEFAULT 0,
+    estimated_cost_usd REAL,
+    success INTEGER,
+    end_reason TEXT,
+    quality_score REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_skill_invocations_skill ON skill_invocations(skill_name, invoked_at DESC);
+CREATE INDEX IF NOT EXISTS idx_skill_invocations_cron ON skill_invocations(cron_id, invoked_at DESC);
+CREATE INDEX IF NOT EXISTS idx_skill_invocations_session ON skill_invocations(session_id);
+
+CREATE VIEW IF NOT EXISTS skill_stats_daily AS
+SELECT
+    skill_name,
+    model,
+    provider,
+    DATE(invoked_at, 'unixepoch') AS day,
+    COUNT(*) AS invocation_count,
+    SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS success_count,
+    SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failure_count,
+    AVG(duration_seconds) AS avg_duration_s,
+    SUM(estimated_cost_usd) AS total_cost_usd,
+    AVG(estimated_cost_usd) AS avg_cost_usd,
+    SUM(input_tokens) AS total_input_tokens,
+    SUM(output_tokens) AS total_output_tokens,
+    AVG(quality_score) AS avg_quality_score,
+    MAX(invoked_at) AS last_invoked_at
+FROM skill_invocations
+GROUP BY skill_name, model, provider, day;
 """
 
 FTS_SQL = """
@@ -673,6 +717,160 @@ class SessionDB:
         def _do(conn):
             conn.execute(sql, params)
         self._execute_write(_do)
+
+    def record_skill_invocation(
+        self,
+        *,
+        skill_name: str,
+        invoked_at: float,
+        session_id: Optional[str] = None,
+        cron_id: Optional[str] = None,
+        skill_version: Optional[str] = None,
+        completed_at: Optional[float] = None,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+        duration_seconds: Optional[float] = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        estimated_cost_usd: Optional[float] = None,
+        success: Optional[bool] = None,
+        end_reason: Optional[str] = None,
+        quality_score: Optional[float] = None,
+    ) -> int:
+        """Insert one ``skill_invocations`` row and return the new id.
+
+        One row per (skill_name, cron run) — see ``cron/scheduler.py`` for the
+        cron-side caller. Slash-command and ad-hoc skill_view invocations are
+        not tracked here in v1.
+
+        ``success`` is stored as 0/1 to match the SQLite REAL-vs-INTEGER
+        convention used elsewhere in the schema; ``None`` is left as NULL.
+        """
+        sql = """INSERT INTO skill_invocations (
+            session_id, cron_id, skill_name, skill_version,
+            invoked_at, completed_at, model, provider,
+            duration_seconds,
+            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+            estimated_cost_usd, success, end_reason, quality_score
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+        success_int: Optional[int]
+        if success is None:
+            success_int = None
+        else:
+            success_int = 1 if success else 0
+        params = (
+            session_id, cron_id, skill_name, skill_version,
+            invoked_at, completed_at, model, provider,
+            duration_seconds,
+            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+            estimated_cost_usd, success_int, end_reason, quality_score,
+        )
+
+        new_id_holder: Dict[str, int] = {}
+
+        def _do(conn):
+            cur = conn.execute(sql, params)
+            new_id_holder["id"] = int(cur.lastrowid or 0)
+
+        self._execute_write(_do)
+        return new_id_holder.get("id", 0)
+
+    def query_skill_ema(
+        self,
+        window_days: int = 14,
+        alpha: float = 0.3,
+    ) -> List[Dict[str, Any]]:
+        """Per-(skill_name, model) exponentially-weighted moving averages.
+
+        Reads ``skill_stats_daily`` for the last *window_days* and applies
+        exponential weighting where the most recent day has weight ``alpha``,
+        the next has ``alpha * (1-alpha)``, and so on. The default
+        ``alpha=0.3`` gives roughly a 5-day half-life — recent behaviour
+        dominates without dropping older data on a hard window.
+
+        Returns a list of dicts (one per (skill_name, model) bucket) with
+        keys::
+
+            skill_name, model, provider,
+            sample_count, success_count, failure_count,
+            ema_success_rate, ema_duration_s, ema_cost_per_call,
+            days_with_data, last_invoked_at
+
+        Sorted by ``last_invoked_at`` descending so the dashboard surfaces
+        currently-active skills first. Buckets with zero rows in the window
+        are silently omitted.
+        """
+        if window_days <= 0 or alpha <= 0 or alpha >= 1:
+            return []
+        cutoff_ts = time.time() - window_days * 86400.0
+        sql = (
+            "SELECT skill_name, model, provider, day, "
+            "invocation_count, success_count, failure_count, "
+            "avg_duration_s, avg_cost_usd, avg_quality_score, last_invoked_at "
+            "FROM skill_stats_daily "
+            "WHERE last_invoked_at >= ? "
+            "ORDER BY skill_name, model, day"
+        )
+        with self._lock:
+            cur = self._conn.execute(sql, (cutoff_ts,))
+            rows = [dict(r) for r in cur.fetchall()]
+
+        groups: Dict[Tuple[str, Optional[str]], List[Dict[str, Any]]] = {}
+        for r in rows:
+            key = (r["skill_name"], r["model"])
+            groups.setdefault(key, []).append(r)
+
+        out: List[Dict[str, Any]] = []
+        for (skill_name, model), rs in groups.items():
+            rs.sort(key=lambda r: r["day"])
+            n = len(rs)
+            raw_weights = [alpha * (1 - alpha) ** (n - 1 - i) for i in range(n)]
+            wsum = sum(raw_weights)
+            weights = (
+                [w / wsum for w in raw_weights]
+                if wsum > 0
+                else [1.0 / n] * n
+            )
+
+            sample_count = sum(int(r["invocation_count"] or 0) for r in rs)
+            success_count = sum(int(r["success_count"] or 0) for r in rs)
+            failure_count = sum(int(r["failure_count"] or 0) for r in rs)
+
+            ema_success_rate = sum(
+                w * (
+                    (int(r["success_count"] or 0) / max(1, int(r["invocation_count"] or 0)))
+                )
+                for w, r in zip(weights, rs)
+            )
+            ema_duration = sum(
+                w * float(r["avg_duration_s"] or 0.0)
+                for w, r in zip(weights, rs)
+            )
+            ema_cost = sum(
+                w * float(r["avg_cost_usd"] or 0.0)
+                for w, r in zip(weights, rs)
+            )
+            last_invoked = max(float(r["last_invoked_at"] or 0.0) for r in rs)
+            provider_latest = rs[-1].get("provider")
+
+            out.append({
+                "skill_name": skill_name,
+                "model": model,
+                "provider": provider_latest,
+                "sample_count": sample_count,
+                "success_count": success_count,
+                "failure_count": failure_count,
+                "ema_success_rate": ema_success_rate,
+                "ema_duration_s": ema_duration,
+                "ema_cost_per_call": ema_cost,
+                "days_with_data": n,
+                "last_invoked_at": last_invoked,
+            })
+
+        out.sort(key=lambda x: x["last_invoked_at"], reverse=True)
+        return out
 
     def ensure_session(
         self,

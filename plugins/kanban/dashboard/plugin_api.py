@@ -860,12 +860,25 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 if payload.status is not None and not payload.archive:
                     s = payload.status
                     if s == "done":
-                        ok = kanban_db.complete_task(
-                            conn, tid,
-                            result=payload.result,
-                            summary=payload.summary,
-                            metadata=payload.metadata,
-                        )
+                        try:
+                            ok = kanban_db.complete_task(
+                                conn, tid,
+                                result=payload.result,
+                                summary=payload.summary,
+                                metadata=payload.metadata,
+                            )
+                        except kanban_db.CompletionEvidenceError as exc:
+                            # Phantom-done guard: task has no result/summary/comment.
+                            # Surface as a per-entry failure with a machine-readable key
+                            # so callers can distinguish evidence rejection from a generic
+                            # failure or not-found.
+                            entry.update(
+                                ok=False,
+                                error=str(exc),
+                                blocked_reason="no_completion_evidence",
+                            )
+                            results.append(entry)
+                            continue
                     elif s == "blocked":
                         ok = kanban_db.block_task(conn, tid)
                     elif s == "ready":

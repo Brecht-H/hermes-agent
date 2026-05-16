@@ -813,6 +813,74 @@ def test_bulk_empty_ids_400(client):
     assert r.status_code == 400
 
 
+def test_bulk_done_without_evidence_returns_blocked_reason(client):
+    """Bulk-complete on a no-evidence task must surface ok=False with
+    blocked_reason='no_completion_evidence' — not a generic error, and
+    the HTTP status must still be 200 so sibling results are returned."""
+    a = client.post("/api/plugins/kanban/tasks", json={"title": "no-evidence"}).json()["task"]
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [a["id"]], "status": "done"},
+    )
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert len(results) == 1
+    entry = results[0]
+    assert entry["id"] == a["id"]
+    assert entry["ok"] is False
+    assert entry["blocked_reason"] == "no_completion_evidence"
+    assert "error" in entry
+    # Task must remain in its original status — not silently closed.
+    task = client.get(f"/api/plugins/kanban/tasks/{a['id']}").json()["task"]
+    assert task["status"] != "done"
+
+
+def test_bulk_done_with_evidence_succeeds(client):
+    """Bulk-complete with a result string passes the evidence check and
+    transitions the task to done."""
+    a = client.post("/api/plugins/kanban/tasks", json={"title": "with-evidence"}).json()["task"]
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={
+            "ids": [a["id"]],
+            "status": "done",
+            "result": "DECIDED: shipped",
+            "summary": "DECIDED: shipped",
+        },
+    )
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert len(results) == 1
+    assert results[0]["ok"] is True
+    task = client.get(f"/api/plugins/kanban/tasks/{a['id']}").json()["task"]
+    assert task["status"] == "done"
+
+
+def test_bulk_done_evidence_failure_doesnt_abort_siblings(client):
+    """Two no-evidence tasks submitted in a single bulk-done call must each
+    get ok=False + blocked_reason='no_completion_evidence'; the batch must
+    complete (HTTP 200) rather than aborting on the first rejection."""
+    t1 = client.post("/api/plugins/kanban/tasks", json={"title": "t1-no-evidence"}).json()["task"]
+    t2 = client.post("/api/plugins/kanban/tasks", json={"title": "t2-no-evidence"}).json()["task"]
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [t1["id"], t2["id"]], "status": "done"},
+    )
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert len(results) == 2
+    for entry in results:
+        assert entry["ok"] is False
+        assert entry["blocked_reason"] == "no_completion_evidence"
+    # Neither task should have transitioned to done.
+    for tid in (t1["id"], t2["id"]):
+        task = client.get(f"/api/plugins/kanban/tasks/{tid}").json()["task"]
+        assert task["status"] != "done"
+
+
 # ---------------------------------------------------------------------------
 # /config endpoint
 # ---------------------------------------------------------------------------

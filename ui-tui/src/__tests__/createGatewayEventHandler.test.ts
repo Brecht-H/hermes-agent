@@ -132,6 +132,33 @@ describe('createGatewayEventHandler', () => {
     expect(ctx.system.sys).toHaveBeenCalledWith('compressing 968 messages (~123,400 tok)…')
   })
 
+  it('surfaces self-improvement review summaries as a persistent system line', () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    const onEvent = createGatewayEventHandler(ctx)
+
+    onEvent({
+      payload: { text: "💾 Self-improvement review: Skill 'hermes-release' patched" },
+      type: 'review.summary'
+    } as any)
+
+    expect(ctx.system.sys).toHaveBeenCalledWith(
+      "💾 Self-improvement review: Skill 'hermes-release' patched"
+    )
+  })
+
+  it('ignores review.summary events with empty or missing text', () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    const onEvent = createGatewayEventHandler(ctx)
+
+    onEvent({ payload: { text: '' }, type: 'review.summary' } as any)
+    onEvent({ payload: { text: '   ' }, type: 'review.summary' } as any)
+    onEvent({ payload: undefined, type: 'review.summary' } as any)
+
+    expect(ctx.system.sys).not.toHaveBeenCalled()
+  })
+
   it('clears the visible todo list when the todo tool returns an empty list', () => {
     const appended: Msg[] = []
     const todos = [{ content: 'Boil water', id: 'boil', status: 'in_progress' }]
@@ -708,6 +735,61 @@ describe('createGatewayEventHandler', () => {
     onEvent({ payload: { message: 'boom' }, type: 'error' } as any)
 
     expect(getTurnState().activity).toMatchObject([{ text: 'boom', tone: 'error' }])
+  })
+
+  it('accepts timeout/error subagent terminal statuses and ignores stale live events', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: { goal: 'timeout child', subagent_id: 'sa-timeout', task_index: 0 },
+      type: 'subagent.start'
+    } as any)
+    onEvent({
+      payload: { goal: 'timeout child', status: 'timeout', subagent_id: 'sa-timeout', task_index: 0 },
+      type: 'subagent.complete'
+    } as any)
+
+    expect(getTurnState().subagents.find(s => s.id === 'sa-timeout')?.status).toBe('timeout')
+
+    // Late start/spawn updates must not clobber terminal timeout/error states.
+    onEvent({
+      payload: { goal: 'timeout child', subagent_id: 'sa-timeout', task_index: 0 },
+      type: 'subagent.start'
+    } as any)
+    onEvent({
+      payload: { goal: 'timeout child', subagent_id: 'sa-timeout', task_index: 0 },
+      type: 'subagent.spawn_requested'
+    } as any)
+
+    expect(getTurnState().subagents.find(s => s.id === 'sa-timeout')?.status).toBe('timeout')
+
+    onEvent({
+      payload: { goal: 'error child', subagent_id: 'sa-error', task_index: 1 },
+      type: 'subagent.start'
+    } as any)
+    onEvent({
+      payload: { goal: 'error child', status: 'error', subagent_id: 'sa-error', task_index: 1 },
+      type: 'subagent.complete'
+    } as any)
+
+    expect(getTurnState().subagents.find(s => s.id === 'sa-error')?.status).toBe('error')
+  })
+
+  it('normalizes unknown subagent.complete statuses to completed', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: { goal: 'weird child', subagent_id: 'sa-weird', task_index: 2 },
+      type: 'subagent.start'
+    } as any)
+    onEvent({
+      payload: { goal: 'weird child', status: 'mystery_status', subagent_id: 'sa-weird', task_index: 2 },
+      type: 'subagent.complete'
+    } as any)
+
+    expect(getTurnState().subagents.find(s => s.id === 'sa-weird')?.status).toBe('completed')
   })
 
   it('drops stale reasoning/tool/todos events after ctrl-c until the next message starts', () => {

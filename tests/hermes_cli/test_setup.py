@@ -30,6 +30,17 @@ def _clear_provider_env(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
 
+def _clear_vercel_env(monkeypatch):
+    for key in (
+        "TERMINAL_VERCEL_RUNTIME",
+        "VERCEL_OIDC_TOKEN",
+        "VERCEL_TOKEN",
+        "VERCEL_PROJECT_ID",
+        "VERCEL_TEAM_ID",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
 def _stub_tts(monkeypatch):
     """Stub out TTS prompts so setup_model_provider doesn't block."""
     monkeypatch.setattr("hermes_cli.setup.prompt_choice", lambda q, c, d=0: (
@@ -485,6 +496,7 @@ def test_modal_setup_persists_direct_mode_when_user_chooses_their_own_account(tm
 
 def test_vercel_setup_configures_access_token_auth(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_vercel_env(monkeypatch)
     monkeypatch.setenv("VERCEL_OIDC_TOKEN", "old-oidc")
     monkeypatch.setitem(sys.modules, "vercel", types.ModuleType("vercel"))
     config = load_config()
@@ -515,13 +527,7 @@ def test_vercel_setup_configures_access_token_auth(tmp_path, monkeypatch):
 
 def test_vercel_setup_prefills_project_and_team_from_link_file(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    # Sibling test (test_vercel_setup_configures_access_token_auth) calls
-    # save_env_value which mutates os.environ directly and never restores
-    # it. When xdist schedules both tests in the same worker, VERCEL_*
-    # from the earlier run masks the .vercel/project.json defaults that
-    # this test exercises. Clear them before load.
-    for _leaked in ("VERCEL_TOKEN", "VERCEL_PROJECT_ID", "VERCEL_TEAM_ID", "VERCEL_OIDC_TOKEN"):
-        monkeypatch.delenv(_leaked, raising=False)
+    _clear_vercel_env(monkeypatch)
     project_root = tmp_path / "project"
     nested = project_root / "app" / "src"
     nested.mkdir(parents=True)
@@ -567,43 +573,33 @@ def test_vercel_setup_prefills_project_and_team_from_link_file(tmp_path, monkeyp
     assert defaults["    Vercel team ID"] == "linked-team"
 
 
-def test_offer_launch_chat_relaunches_via_bin(monkeypatch):
-    from hermes_cli import setup as setup_mod
-    from hermes_cli import relaunch as relaunch_mod
+def test_setup_slack_saves_home_channel(monkeypatch):
+    """_setup_slack() saves SLACK_HOME_CHANNEL when the user provides one."""
+    saved = {}
+    prompts = iter(["xoxb-test-token", "xapp-test-token", "", "C01ABC2DE3F"])
 
-    monkeypatch.setattr(setup_mod, "prompt_yes_no", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(relaunch_mod, "resolve_hermes_bin", lambda: "/usr/local/bin/hermes")
+    monkeypatch.setattr(setup_mod, "get_env_value", lambda key: "")
+    monkeypatch.setattr(setup_mod, "save_env_value", lambda k, v: saved.update({k: v}))
+    monkeypatch.setattr(setup_mod, "prompt", lambda *_a, **_kw: next(prompts))
+    monkeypatch.setattr(setup_mod, "prompt_yes_no", lambda *_a, **_kw: False)
+    monkeypatch.setattr(setup_mod, "_write_slack_manifest_and_instruct", lambda: None)
 
-    exec_calls = []
+    setup_mod._setup_slack()
 
-    def fake_execvp(path, argv):
-        exec_calls.append((path, argv))
-        raise SystemExit(0)
-
-    monkeypatch.setattr(relaunch_mod.os, "execvp", fake_execvp)
-
-    with pytest.raises(SystemExit):
-        setup_mod._offer_launch_chat()
-
-    assert exec_calls == [("/usr/local/bin/hermes", ["/usr/local/bin/hermes", "chat"])]
+    assert saved.get("SLACK_HOME_CHANNEL") == "C01ABC2DE3F"
 
 
-def test_offer_launch_chat_falls_back_to_module(monkeypatch):
-    from hermes_cli import setup as setup_mod
-    from hermes_cli import relaunch as relaunch_mod
+def test_setup_slack_home_channel_empty_not_saved(monkeypatch):
+    """_setup_slack() does not save SLACK_HOME_CHANNEL when left blank."""
+    saved = {}
+    prompts = iter(["xoxb-test-token", "xapp-test-token", "", ""])
 
-    monkeypatch.setattr(setup_mod, "prompt_yes_no", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(relaunch_mod, "resolve_hermes_bin", lambda: None)
+    monkeypatch.setattr(setup_mod, "get_env_value", lambda key: "")
+    monkeypatch.setattr(setup_mod, "save_env_value", lambda k, v: saved.update({k: v}))
+    monkeypatch.setattr(setup_mod, "prompt", lambda *_a, **_kw: next(prompts))
+    monkeypatch.setattr(setup_mod, "prompt_yes_no", lambda *_a, **_kw: False)
+    monkeypatch.setattr(setup_mod, "_write_slack_manifest_and_instruct", lambda: None)
 
-    exec_calls = []
+    setup_mod._setup_slack()
 
-    def fake_execvp(path, argv):
-        exec_calls.append((path, argv))
-        raise SystemExit(0)
-
-    monkeypatch.setattr(relaunch_mod.os, "execvp", fake_execvp)
-
-    with pytest.raises(SystemExit):
-        setup_mod._offer_launch_chat()
-
-    assert exec_calls == [(sys.executable, [sys.executable, "-m", "hermes_cli.main", "chat"])]
+    assert "SLACK_HOME_CHANNEL" not in saved

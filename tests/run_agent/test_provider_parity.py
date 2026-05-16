@@ -61,6 +61,8 @@ def _make_agent(monkeypatch, provider, api_mode="chat_completions", base_url="ht
     )
     if model:
         kwargs["model"] = model
+    elif provider == "nous":
+        kwargs["model"] = "gpt-5"
     base_url="https://openrouter.ai/api/v1",
     api_key="test-key",
     base_url="https://openrouter.ai/api/v1",
@@ -343,11 +345,12 @@ class TestBuildApiKwargsAIGateway:
 
 class TestBuildApiKwargsNousPortal:
     def test_includes_nous_product_tags(self, monkeypatch):
+        from agent.portal_tags import nous_portal_tags
         agent = _make_agent(monkeypatch, "nous", base_url="https://inference-api.nousresearch.com/v1")
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
         extra = kwargs.get("extra_body", {})
-        assert extra.get("tags") == ["product=hermes-agent"]
+        assert extra.get("tags") == nous_portal_tags()
 
     def test_uses_chat_completions_format(self, monkeypatch):
         agent = _make_agent(monkeypatch, "nous", base_url="https://inference-api.nousresearch.com/v1")
@@ -945,7 +948,8 @@ class TestAuxiliaryClientProviderPriority:
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
         from agent.auxiliary_client import get_text_auxiliary_client
         with patch("agent.auxiliary_client._read_nous_auth", return_value={"access_token": "nous-tok"}), \
-             patch("agent.auxiliary_client.OpenAI") as mock:
+             patch("agent.auxiliary_client.OpenAI") as mock, \
+             patch("hermes_cli.models.get_nous_recommended_aux_model", return_value=None):
             client, model = get_text_auxiliary_client()
         assert model == "google/gemini-3-flash-preview"
 
@@ -966,17 +970,25 @@ class TestAuxiliaryClientProviderPriority:
             client, model = get_text_auxiliary_client()
         assert mock.call_args.kwargs["base_url"] == "http://localhost:1234/v1"
 
-    def test_codex_fallback_last_resort(self, monkeypatch):
+    def test_codex_not_in_auto_fallback(self, monkeypatch):
+        """Codex is deliberately NOT part of the auto fallback chain.
+
+        ChatGPT-account Codex gates which models it accepts via an
+        undocumented, shifting allow-list, so falling through to Codex with
+        a hardcoded default model breaks silently whenever OpenAI rotates
+        the list.  When nothing else is available, ``get_text_auxiliary_client``
+        now returns (None, None) rather than guessing a Codex model.
+        """
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        from agent.auxiliary_client import get_text_auxiliary_client, CodexAuxiliaryClient
+        from agent.auxiliary_client import get_text_auxiliary_client
         with patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
              patch("agent.auxiliary_client._read_codex_access_token", return_value="codex-tok"), \
              patch("agent.auxiliary_client.OpenAI"):
             client, model = get_text_auxiliary_client()
-        assert model == "gpt-5.2-codex"
-        assert isinstance(client, CodexAuxiliaryClient)
+        assert client is None
+        assert model is None
 
 
 # ── Provider routing tests ───────────────────────────────────────────────────

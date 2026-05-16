@@ -85,8 +85,9 @@ def test_run_slash_create_with_parent_and_cascade(kanban_home):
     out2 = kc.run_slash(f"create 'child' --assignee bob --parent {p}")
     assert "todo" in out2  # child starts as todo
 
-    # Complete parent; list should promote child to ready
-    kc.run_slash(f"complete {p}")
+    # Complete parent; list should promote child to ready.
+    # --result satisfies the completion-evidence invariant.
+    kc.run_slash(f"complete {p} --result 'parent done'")
     # Explicit filter: child should now be ready (was todo before complete).
     ready_list = kc.run_slash("list --status ready")
     assert "child" in ready_list

@@ -96,7 +96,7 @@ def test_link_demotes_ready_child_to_todo_when_parent_not_done(kanban_home):
 def test_link_keeps_ready_child_when_parent_already_done(kanban_home):
     with kb.connect() as conn:
         a = kb.create_task(conn, title="a")
-        kb.complete_task(conn, a)
+        kb.complete_task(conn, a, result="ok")
         b = kb.create_task(conn, title="b")
         assert kb.get_task(conn, b).status == "ready"
         kb.link_tasks(conn, a, b)
@@ -128,9 +128,9 @@ def test_recompute_ready_cascades_through_chain(kanban_home):
         c = kb.create_task(conn, title="c", parents=[b])
         assert [kb.get_task(conn, x).status for x in (a, b, c)] == \
                ["ready", "todo", "todo"]
-        kb.complete_task(conn, a)
+        kb.complete_task(conn, a, result="ok")
         assert kb.get_task(conn, b).status == "ready"
-        kb.complete_task(conn, b)
+        kb.complete_task(conn, b, result="ok")
         assert kb.get_task(conn, c).status == "ready"
 
 
@@ -139,9 +139,9 @@ def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
         a = kb.create_task(conn, title="a")
         b = kb.create_task(conn, title="b")
         c = kb.create_task(conn, title="c", parents=[a, b])
-        kb.complete_task(conn, a)
+        kb.complete_task(conn, a, result="ok")
         assert kb.get_task(conn, c).status == "todo"
-        kb.complete_task(conn, b)
+        kb.complete_task(conn, b, result="ok")
         assert kb.get_task(conn, c).status == "ready"
 
 
@@ -528,7 +528,7 @@ def test_list_tasks_assignee_filter_case_insensitive(kanban_home):
 def test_archive_hides_from_default_list(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x")
-        kb.complete_task(conn, t)
+        kb.complete_task(conn, t, result="ok")
         assert kb.archive_task(conn, t)
         assert len(kb.list_tasks(conn)) == 0
         assert len(kb.list_tasks(conn, include_archived=True)) == 1
@@ -662,7 +662,7 @@ def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable
         p = kb.create_task(conn, title="p", assignee="alice")
         c = kb.create_task(conn, title="c", assignee="bob", parents=[p])
         # Finish parent outside dispatch; promotion happens inside.
-        kb.complete_task(conn, p)
+        kb.complete_task(conn, p, result="ok")
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
     # Spawned c (a was already done when dispatch was called).
     assert len(spawns) == 1
@@ -1228,7 +1228,7 @@ def test_unlink_tasks_triggers_recompute_ready(kanban_home):
     with kb.connect() as conn:
         # A is done.
         a = kb.create_task(conn, title="parent-done")
-        kb.complete_task(conn, a)
+        kb.complete_task(conn, a, result="ok")
 
         # C is running (not done) — blocks child B.
         c = kb.create_task(conn, title="parent-running")
@@ -1530,3 +1530,99 @@ def test_task_dict_survives_corrupt_created_at(tmp_path, monkeypatch):
         conn.close()
     age = kb.task_age(task)
     assert age["created_age_seconds"] is None
+
+
+# ---------------------------------------------------------------------------
+# Completion-evidence invariant (phantom-done guard)
+# ---------------------------------------------------------------------------
+
+def test_complete_with_result_succeeds(kanban_home):
+    """A completion with a non-empty result is the happy path: the task
+    transitions to done and the result is persisted."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+        assert kb.complete_task(conn, tid, result="shipped the fix") is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "done"
+        assert task.result == "shipped the fix"
+
+
+def test_complete_without_evidence_raises_and_audits(kanban_home):
+    """A completion with no result, no summary, and no comment is blocked
+    by CompletionEvidenceError, the task stays NOT done, and a
+    completion_blocked_no_evidence event is emitted for auditing."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+        with pytest.raises(kb.CompletionEvidenceError) as excinfo:
+            kb.complete_task(conn, tid)
+        assert excinfo.value.task_id == tid
+        # Task never mutated to done — stays in its prior (running) state.
+        assert kb.get_task(conn, tid).status == "running"
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "completion_blocked_no_evidence" in kinds
+        assert "completed" not in kinds
+
+
+def test_complete_with_empty_result_raises(kanban_home):
+    """A whitespace-only / empty-string result is not evidence."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+        with pytest.raises(kb.CompletionEvidenceError):
+            kb.complete_task(conn, tid, result="   ")
+
+
+def test_complete_with_comment_as_evidence_succeeds(kanban_home):
+    """A task with no result but at least one non-empty comment passes
+    the guard — a comment counts as completion evidence."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+        kb.add_comment(conn, tid, author="mac", body="verified live, closing")
+        assert kb.complete_task(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_complete_with_summary_as_evidence_succeeds(kanban_home):
+    """A task with a summary but no result passes the guard — the
+    summary is completion evidence."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+        assert kb.complete_task(conn, tid, summary="did the work") is True
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_has_completion_evidence_helper(kanban_home):
+    """Unit-level coverage of the _has_completion_evidence helper."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x")
+        # No evidence at all.
+        assert kb._has_completion_evidence(conn, tid, None, None) is False
+        assert kb._has_completion_evidence(conn, tid, "", "  ") is False
+        # Result / summary are evidence.
+        assert kb._has_completion_evidence(conn, tid, "r", None) is True
+        assert kb._has_completion_evidence(conn, tid, None, "s") is True
+        # An empty comment body cannot be inserted (add_comment rejects
+        # it), so a present comment always counts as evidence.
+        kb.add_comment(conn, tid, author="mac", body="evidence")
+        assert kb._has_completion_evidence(conn, tid, None, None) is True
+
+
+def test_edit_completed_task_result_still_works(kanban_home):
+    """edit_completed_task_result remains the supported path for
+    attaching a result after the fact — unaffected by the guard."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+        # Complete with a comment as evidence (no result).
+        kb.add_comment(conn, tid, author="mac", body="closing")
+        assert kb.complete_task(conn, tid) is True
+        assert kb.get_task(conn, tid).result is None
+        # Backfill the result after the fact.
+        assert kb.edit_completed_task_result(
+            conn, tid, result="backfilled result"
+        ) is True
+        assert kb.get_task(conn, tid).result == "backfilled result"

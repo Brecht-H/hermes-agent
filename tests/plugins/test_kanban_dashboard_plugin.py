@@ -258,10 +258,11 @@ def test_patch_drag_drop_move_todo_to_ready(client):
     )
     assert r.status_code == 409
 
-    # Complete the parent.
+    # Complete the parent. A result satisfies the completion-evidence
+    # invariant (phantom-done guard).
     r = client.patch(
         f"/api/plugins/kanban/tasks/{parent['id']}",
-        json={"status": "done"},
+        json={"status": "done", "result": "parent done"},
     )
     assert r.status_code == 200
 
@@ -486,9 +487,10 @@ def test_board_progress_rollup(client):
     ).json()["task"]
     # Children start as "todo" because the parent isn't done yet.  Set the
     # parent to done so children auto-promote to ready via recompute_ready.
+    # A result satisfies the completion-evidence invariant.
     r = client.patch(
         f"/api/plugins/kanban/tasks/{parent['id']}",
-        json={"status": "done"},
+        json={"status": "done", "result": "parent done"},
     )
     assert r.status_code == 200
     # Verify children are now ready.
@@ -507,7 +509,7 @@ def test_board_progress_rollup(client):
     # Complete one child. 1/2.
     r = client.patch(
         f"/api/plugins/kanban/tasks/{child_a['id']}",
-        json={"status": "done"},
+        json={"status": "done", "result": "child a done"},
     )
     assert r.status_code == 200
     r = client.get("/api/plugins/kanban/board")

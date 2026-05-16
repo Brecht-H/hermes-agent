@@ -392,14 +392,14 @@ def _(home, kb):
         # Complete 499 parents
         for p in parents[:-1]:
             kb.claim_task(conn, p)
-            kb.complete_task(conn, p)
+            kb.complete_task(conn, p, result="ok")
         kb.recompute_ready(conn)
         assert kb.get_task(conn, child).status == "todo", (
             "child should still be todo with 1/500 parents incomplete"
         )
         # Finish the last one
         kb.claim_task(conn, parents[-1])
-        kb.complete_task(conn, parents[-1])
+        kb.complete_task(conn, parents[-1], result="ok")
         kb.recompute_ready(conn)
         assert kb.get_task(conn, child).status == "ready"
         print(f"  500 parents → 1 child promotion works")
@@ -903,12 +903,18 @@ def _(home, kb):
         # Empty body → accept (legitimate: just title says it all)
         tid = kb.create_task(conn, title="empty body ok", body="", assignee="w")
         assert kb.get_task(conn, tid).body in ("", None)
-        # Empty summary on complete → accept
+        # Empty summary on complete → REJECT. An empty summary is not
+        # completion evidence; the phantom-done guard blocks it.
         kb.claim_task(conn, tid)
-        kb.complete_task(conn, tid, summary="")
-        run = kb.latest_run(conn, tid)
-        # Empty summary falls back to result; both empty → None on run
-        print(f"  empty body accepted, empty-title rejected")
+        try:
+            kb.complete_task(conn, tid, summary="")
+            raise AssertionError("empty-summary completion should be rejected")
+        except kb.CompletionEvidenceError:
+            pass
+        # A non-empty result completes it cleanly.
+        kb.complete_task(conn, tid, result="done")
+        assert kb.get_task(conn, tid).status == "done"
+        print(f"  empty body accepted, empty-summary completion rejected")
     finally:
         conn.close()
 
@@ -950,7 +956,7 @@ def _(home, kb):
         kb.archive_task(conn, p_archived)
         p_done = kb.create_task(conn, title="p-done", assignee="w")
         kb.claim_task(conn, p_done)
-        kb.complete_task(conn, p_done)
+        kb.complete_task(conn, p_done, result="ok")
 
         # Child with just one parent, cycle it through each state
         for parent, expected in [

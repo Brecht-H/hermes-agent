@@ -2348,6 +2348,58 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class CompletionEvidenceError(ValueError):
+    """Raised by ``complete_task`` when a task is asked to transition to
+    ``done`` with no completion evidence at all — no ``result``, no
+    ``summary``, and zero non-empty comments.
+
+    This is the "phantom-done" guard: a task reaching ``done`` with an
+    empty ``result`` and no comment leaves no audit trail of what was
+    actually delivered. The completing task id is attached as
+    ``.task_id``. Kept as a ``ValueError`` subclass (mirroring
+    :class:`HallucinatedCardsError`) so existing tool-error handlers
+    treat it as a recoverable user error.
+    """
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        super().__init__(
+            f"completion blocked: task {task_id} has no completion "
+            f"evidence — provide a non-empty result, a summary, or at "
+            f"least one comment with evidence before marking it done"
+        )
+
+
+def _has_completion_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    result: Optional[str],
+    summary: Optional[str],
+) -> bool:
+    """Return True if the task has *any* completion evidence.
+
+    Evidence is satisfied by ANY of:
+      * a non-empty ``result`` (after strip);
+      * a non-empty ``summary`` (after strip);
+      * at least one row in ``task_comments`` whose body is non-empty.
+
+    A comment counts as evidence per the phantom-done invariant — an
+    operator (or the janitor's ``explicit_complete_comment`` auto-close)
+    leaving a substantive comment is a legitimate completion record.
+    """
+    if result and result.strip():
+        return True
+    if summary and summary.strip():
+        return True
+    row = conn.execute(
+        "SELECT 1 FROM task_comments "
+        "WHERE task_id = ? AND TRIM(COALESCE(body, '')) != '' "
+        "LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return row is not None
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2414,6 +2466,36 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # Gate: enforce the completion-evidence invariant. A task must not
+    # reach 'done' with an empty result AND no summary AND no comment —
+    # that is the "phantom-done" pathology (no audit trail of what was
+    # delivered). Mirrors the created_cards gate above: verify BEFORE
+    # the main write txn, emit an auditable event in a tiny dedicated
+    # txn, then raise. The task never mutates to 'done' on rejection.
+    #
+    # The gate only applies to tasks that are actually in a completable
+    # state (running/ready/blocked). For terminal/unknown tasks the main
+    # write txn's rowcount check already returns False — raising here
+    # would change that long-standing "refuse, don't error" contract.
+    status_row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if (
+        status_row is not None
+        and status_row["status"] in ("running", "ready", "blocked")
+        and not _has_completion_evidence(conn, task_id, result, summary)
+    ):
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_blocked_no_evidence",
+                {
+                    "status": status_row["status"],
+                    "has_result": bool(result and result.strip()),
+                    "has_summary": bool(summary and summary.strip()),
+                },
+            )
+        raise CompletionEvidenceError(task_id)
 
     with write_txn(conn):
         if expected_run_id is None:

@@ -631,7 +631,7 @@ def test_gc_events_keeps_active_task_history(kanban_home):
     try:
         alive = kb.create_task(conn, title="a", assignee="w")
         done_id = kb.create_task(conn, title="b", assignee="w")
-        kb.complete_task(conn, done_id)
+        kb.complete_task(conn, done_id, result="ok")
 
         # Force all existing events to "old" by bumping created_at backwards.
         with kb.write_txn(conn):
@@ -1754,7 +1754,7 @@ def test_cli_edit_backfills_result_on_done_task(kanban_home):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="x", assignee="worker")
-        kb.complete_task(conn, tid)
+        kb.complete_task(conn, tid, result="ok")
     finally:
         conn.close()
 
@@ -1919,8 +1919,25 @@ def test_cli_bulk_complete_with_summary_rejects(kanban_home):
         conn.close()
 
 
-def test_cli_bulk_complete_without_summary_still_works(kanban_home):
-    """Bulk close with no per-task handoff is allowed — the common case."""
+def test_cli_bulk_complete_with_result_works(kanban_home):
+    """Bulk close with a shared --result applies that result to every
+    task and succeeds (the result is completion evidence)."""
+    conn = kb.connect()
+    try:
+        a = kb.create_task(conn, title="a", assignee="worker")
+        b = kb.create_task(conn, title="b", assignee="worker")
+        kb.claim_task(conn, a); kb.claim_task(conn, b)
+    finally:
+        conn.close()
+    out = run_slash(f"complete {a} {b} --result 'bulk done'")
+    assert f"Completed {a}" in out
+    assert f"Completed {b}" in out
+
+
+def test_cli_bulk_complete_without_evidence_is_rejected(kanban_home):
+    """Bulk close with no --result / --summary and no comments is
+    rejected per task by the phantom-done guard. The CLI prints an
+    actionable message and the tasks stay NOT done."""
     conn = kb.connect()
     try:
         a = kb.create_task(conn, title="a", assignee="worker")
@@ -1929,8 +1946,12 @@ def test_cli_bulk_complete_without_summary_still_works(kanban_home):
     finally:
         conn.close()
     out = run_slash(f"complete {a} {b}")
-    assert f"Completed {a}" in out
-    assert f"Completed {b}" in out
+    assert f"cannot complete {a}" in out
+    assert f"cannot complete {b}" in out
+    assert "no completion evidence" in out
+    with kb.connect() as conn:
+        assert kb.get_task(conn, a).status != "done"
+        assert kb.get_task(conn, b).status != "done"
 
 
 def test_completed_event_payload_carries_summary(kanban_home):
@@ -1952,15 +1973,40 @@ def test_completed_event_payload_carries_summary(kanban_home):
 
 
 def test_completed_event_payload_summary_none_when_missing(kanban_home):
-    """If the caller passes no summary AND no result, payload.summary is None."""
+    """If the caller passes a result but no explicit summary, the
+    completed-event payload still carries a summary derived from the
+    result (summary falls back to result)."""
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="x", assignee="worker")
         kb.claim_task(conn, tid)
-        kb.complete_task(conn, tid)  # no summary, no result
+        # A bare no-evidence completion is now rejected by the
+        # phantom-done guard, so pass a result; summary falls back to it.
+        kb.complete_task(conn, tid, result="delivered x")
         events = kb.list_events(conn, tid)
         comp = [e for e in events if e.kind == "completed"][0]
-        assert comp.payload.get("summary") is None
+        assert comp.payload.get("summary") == "delivered x"
+    finally:
+        conn.close()
+
+
+def test_complete_with_no_evidence_is_rejected(kanban_home):
+    """A bare completion — no result, no summary, no comment — is
+    blocked by the phantom-done guard. The task stays NOT done and a
+    completion_blocked_no_evidence event is recorded for audit."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+        with pytest.raises(kb.CompletionEvidenceError) as excinfo:
+            kb.complete_task(conn, tid)
+        assert excinfo.value.task_id == tid
+        # Task never reached 'done'.
+        assert kb.get_task(conn, tid).status != "done"
+        # Auditable rejection event emitted.
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "completion_blocked_no_evidence" in kinds
+        assert "completed" not in kinds
     finally:
         conn.close()
 
@@ -2024,14 +2070,17 @@ def test_block_never_claimed_task_synthesizes_run(kanban_home):
         conn.close()
 
 
-def test_complete_never_claimed_without_handoff_skips_synthesis(kanban_home):
-    """If a bulk-complete passes no summary/metadata/result, don't spam
-    the runs table with empty synthetic rows."""
+def test_complete_never_claimed_without_handoff_is_rejected(kanban_home):
+    """A never-claimed (ready) task completed with no handoff fields at
+    all is rejected by the phantom-done guard — completion needs a
+    result, summary, or comment. No synthetic run row is created
+    because the task never transitions to 'done'."""
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="simple", assignee="worker")
-        ok = kb.complete_task(conn, tid)  # no handoff fields
-        assert ok is True
+        with pytest.raises(kb.CompletionEvidenceError):
+            kb.complete_task(conn, tid)  # no handoff fields
+        assert kb.get_task(conn, tid).status != "done"
         assert kb.list_runs(conn, tid) == []  # no synthetic row
     finally:
         conn.close()

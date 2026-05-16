@@ -1563,13 +1563,27 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect() as conn:
         for tid in ids:
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                completed = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except kb.CompletionEvidenceError as exc:
+                # Phantom-done guard tripped: the task has no result, no
+                # summary, and no comment. Refuse cleanly with an
+                # actionable message instead of silently closing it.
+                failed.append(tid)
+                print(
+                    f"cannot complete {tid}: {exc}\n"
+                    f"  → pass --result \"<what was delivered>\", or add a "
+                    f"comment first: hermes kanban comment {tid} \"<evidence>\"",
+                    file=sys.stderr,
+                )
+                continue
+            if not completed:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:

@@ -605,12 +605,18 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             s = payload.status
             ok = True
             if s == "done":
-                ok = kanban_db.complete_task(
-                    conn, task_id,
-                    result=payload.result,
-                    summary=payload.summary,
-                    metadata=payload.metadata,
-                )
+                try:
+                    ok = kanban_db.complete_task(
+                        conn, task_id,
+                        result=payload.result,
+                        summary=payload.summary,
+                        metadata=payload.metadata,
+                    )
+                except kanban_db.CompletionEvidenceError as exc:
+                    # Phantom-done guard: refuse to close a task with no
+                    # result, no summary, and no comment. 409 mirrors the
+                    # other "transition not valid" rejections below.
+                    raise HTTPException(status_code=409, detail=str(exc))
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "ready":

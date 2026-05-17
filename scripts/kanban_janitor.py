@@ -140,12 +140,27 @@ def row_to_comment(row: sqlite3.Row) -> Comment:
     )
 
 
+def _table_exists(con: sqlite3.Connection, name: str) -> bool:
+    """True if ``name`` is a table in this SQLite DB."""
+    return con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone() is not None
+
+
 def fetch_tasks(con: sqlite3.Connection) -> list[Task]:
+    # A legacy/profile DB may have no `tasks` table at all — the default
+    # --legacy-db (profiles/daily/kanban.db) is exactly such a DB. Treat it as
+    # empty rather than crashing the whole janitor run on its default args with
+    # ``OperationalError: no such table: tasks``.
+    if not _table_exists(con, "tasks"):
+        return []
     return [row_to_task(r) for r in con.execute("SELECT * FROM tasks ORDER BY created_at ASC, id ASC")]
 
 
 def fetch_comments(con: sqlite3.Connection) -> dict[str, list[Comment]]:
     comments: dict[str, list[Comment]] = defaultdict(list)
+    if not _table_exists(con, "task_comments"):
+        return comments
     for row in con.execute("SELECT * FROM task_comments ORDER BY created_at ASC, id ASC"):
         comment = row_to_comment(row)
         comments[comment.task_id].append(comment)
